@@ -1,18 +1,28 @@
 const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
-// 1. DYNAMIC PORT: Required for Cloud Deployment (Render/Railway)
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocketServer({ port: PORT });
 
 // roomId -> Map(username -> { currentProblem, sockets: Set(ws) })
-const rooms = new Map(); 
+const rooms = new Map();
+
+function generateRoomId() {
+  let roomId;
+  do {
+    // Generates a readable 6-character code like "TUF-9B2X"
+    const randomHex = crypto.randomBytes(3).toString("hex").toUpperCase();
+    roomId = `TUF-${randomHex}`;
+  } while (rooms.has(roomId));
+  return roomId;
+}
 
 function broadcastRoomPresence(roomId) {
   if (!rooms.has(roomId)) return;
-  
+
   const room = rooms.get(roomId);
   const members = [];
-  
+
   for (const [username, data] of room.entries()) {
     members.push({
       username: username,
@@ -20,11 +30,15 @@ function broadcastRoomPresence(roomId) {
     });
   }
 
-  const message = JSON.stringify({ type: "ROOM_PRESENCE", members });
+  const message = JSON.stringify({ 
+    type: "ROOM_PRESENCE", 
+    roomId,
+    members 
+  });
 
   for (const data of room.values()) {
     for (const client of data.sockets) {
-      if (client.readyState === 1) { // 1 === OPEN
+      if (client.readyState === 1) { // OPEN
         client.send(message);
       }
     }
@@ -35,10 +49,7 @@ wss.on("connection", (ws) => {
   let userRoom = null;
   let userName = null;
 
-  // 2. ERROR HANDLER: Prevents random socket drops from crashing the whole server
   ws.on("error", console.error);
-
-  // 3. HEARTBEAT INIT: Mark connection as alive
   ws.isAlive = true;
   ws.on("pong", () => { ws.isAlive = true; });
 
@@ -46,30 +57,58 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(raw);
 
+      // 1. CREATE NEW ROOM
+      if (data.type === "CREATE_ROOM") {
+        const newRoomId = generateRoomId();
+        rooms.set(newRoomId, new Map());
+
+        ws.send(JSON.stringify({
+          type: "ROOM_CREATED",
+          roomId: newRoomId
+        }));
+        console.log(`Created room: ${newRoomId}`);
+        return;
+      }
+
+      // 2. JOIN ROOM
       if (data.type === "JOIN_ROOM") {
         const { roomId, username } = data;
-        userRoom = roomId;
-        userName = username || "Anonymous";
+        const normalizedRoomId = (roomId || "").trim().toUpperCase();
 
-        if (!rooms.has(roomId)) {
-          rooms.set(roomId, new Map());
+        if (!rooms.has(normalizedRoomId)) {
+          // If room doesn't exist, notify client
+          ws.send(JSON.stringify({
+            type: "ROOM_ERROR",
+            message: `Room "${normalizedRoomId}" does not exist. Check the ID or create a new room.`
+          }));
+          return;
         }
 
-        const room = rooms.get(roomId);
-        
+        userRoom = normalizedRoomId;
+        userName = (username || "Anonymous").trim();
+
+        const room = rooms.get(userRoom);
+
         if (!room.has(userName)) {
-          room.set(userName, { 
-            currentProblem: "Viewing sheet", 
-            sockets: new Set() 
+          room.set(userName, {
+            currentProblem: "Viewing sheet",
+            sockets: new Set()
           });
         }
 
         room.get(userName).sockets.add(ws);
 
-        console.log(`🟢 ${userName} joined room: ${roomId} (Tabs open: ${room.get(userName).sockets.size})`);
-        broadcastRoomPresence(roomId);
+        ws.send(JSON.stringify({
+          type: "JOIN_SUCCESS",
+          roomId: userRoom,
+          username: userName
+        }));
+
+        console.log(`🟢 ${userName} joined room: ${userRoom}`);
+        broadcastRoomPresence(userRoom);
       }
 
+      // 3. SET PROBLEM
       if (data.type === "SET_PROBLEM" && userRoom && userName && rooms.has(userRoom)) {
         const room = rooms.get(userRoom);
         if (room.has(userName)) {
@@ -77,36 +116,47 @@ wss.on("connection", (ws) => {
           broadcastRoomPresence(userRoom);
         }
       }
+
+      // 4. EXPLICIT LEAVE ROOM
+      if (data.type === "LEAVE_ROOM" && userRoom && userName && rooms.has(userRoom)) {
+        cleanupUser(userRoom, userName, ws);
+        userRoom = null;
+        userName = null;
+      }
     } catch (err) {
       console.error("Message parse error:", err);
     }
   });
 
+  function cleanupUser(roomId, user, socket) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+
+    if (room.has(user)) {
+      const userData = room.get(user);
+      userData.sockets.delete(socket);
+
+      if (userData.sockets.size === 0) {
+        room.delete(user);
+        console.log(`🔴 ${user} left room: ${roomId}`);
+      }
+    }
+
+    if (room.size === 0) {
+      rooms.delete(roomId);
+      console.log(`🗑️ Room deleted (empty): ${roomId}`);
+    } else {
+      broadcastRoomPresence(roomId);
+    }
+  }
+
   ws.on("close", () => {
-    if (userRoom && userName && rooms.has(userRoom)) {
-      const room = rooms.get(userRoom);
-      
-      if (room.has(userName)) {
-        const userData = room.get(userName);
-        
-        userData.sockets.delete(ws);
-        
-        if (userData.sockets.size === 0) {
-          room.delete(userName);
-          console.log(`🔴 ${userName} left room: ${userRoom}`);
-        }
-      }
-      
-      if (room.size === 0) {
-        rooms.delete(userRoom); 
-      } else {
-        broadcastRoomPresence(userRoom); 
-      }
+    if (userRoom && userName) {
+      cleanupUser(userRoom, userName, ws);
     }
   });
 });
 
-// 4. HEARTBEAT INTERVAL: Ping all clients every 30 seconds to prevent cloud disconnects
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
